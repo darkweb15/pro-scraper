@@ -22,6 +22,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.os_manager import ChromeType
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 app = Flask(__name__)
@@ -66,7 +67,11 @@ def build_chrome(headless_mode=False, proxy=None):
             opts.binary_location = path
             break
     
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+    try:
+        driver_path = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
+    except:
+        driver_path = ChromeDriverManager().install()
+    return webdriver.Chrome(service=Service(driver_path), options=opts)
 
 def find_emails(html):
     if not html: return []
