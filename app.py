@@ -48,9 +48,24 @@ def build_chrome(headless_mode=False, proxy=None):
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-software-rasterizer")
     opts.add_argument(f"--user-agent={random.choice(USER_AGENTS)}")
     if headless_mode: opts.add_argument("--headless=new")
     if proxy: opts.add_argument(f"--proxy-server={proxy}")
+    
+    # Try to find Chrome/Chromium binary
+    chrome_paths = [
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable"
+    ]
+    
+    for path in chrome_paths:
+        if os.path.exists(path):
+            opts.binary_location = path
+            break
+    
     return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
 
 def find_emails(html):
