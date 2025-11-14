@@ -27,22 +27,36 @@ from webdriver_manager.core.os_manager import ChromeType
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 app = Flask(__name__)
 
-APP_STATE = {"scraping_active": False, "stop_scraping_flag": False, "status_message": "Ready!", "link_collection_progress": 0.0, "detail_scraping_progress": 0.0, "link_count": 0, "scraped_count": 0, "total_to_scrape": 0, "results_df": pd.DataFrame(), "collected_links": [], "current_save_file": None, "last_save_time": None}
-state_lock = threading.Lock()
+SESSIONS = {}
+SESSIONS_LOCK = threading.Lock()
+MAX_CONCURRENT_SESSIONS = 20
+
+def get_session(session_id):
+    with SESSIONS_LOCK:
+        if session_id not in SESSIONS:
+            SESSIONS[session_id] = {
+                "scraping_active": False, "stop_scraping_flag": False, "status_message": "Ready!",
+                "link_collection_progress": 0.0, "detail_scraping_progress": 0.0,
+                "link_count": 0, "scraped_count": 0, "total_to_scrape": 0,
+                "results_df": pd.DataFrame(), "collected_links": [],
+                "lock": threading.Lock()
+            }
+        return SESSIONS[session_id]
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r'(\+?\d[\d\s\-\(\)]{8,})')
 USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"]
 DATA_DIR = "scraper_data"
 if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
 
-def update_status(message, link_progress=None, detail_progress=None, link_count=None, scraped_count=None, total_to_scrape=None):
-    with state_lock:
-        APP_STATE["status_message"] = message
-        if link_progress is not None: APP_STATE["link_collection_progress"] = link_progress
-        if detail_progress is not None: APP_STATE["detail_scraping_progress"] = detail_progress
-        if link_count is not None: APP_STATE["link_count"] = link_count
-        if scraped_count is not None: APP_STATE["scraped_count"] = scraped_count
-        if total_to_scrape is not None: APP_STATE["total_to_scrape"] = total_to_scrape
+def update_status(session_id, message, link_progress=None, detail_progress=None, link_count=None, scraped_count=None, total_to_scrape=None):
+    session = get_session(session_id)
+    with session["lock"]:
+        session["status_message"] = message
+        if link_progress is not None: session["link_collection_progress"] = link_progress
+        if detail_progress is not None: session["detail_scraping_progress"] = detail_progress
+        if link_count is not None: session["link_count"] = link_count
+        if scraped_count is not None: session["scraped_count"] = scraped_count
+        if total_to_scrape is not None: session["total_to_scrape"] = total_to_scrape
 
 def build_chrome(headless_mode=False, proxy=None):
     opts = Options()
@@ -50,16 +64,21 @@ def build_chrome(headless_mode=False, proxy=None):
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-images")
+    opts.add_argument("--disable-javascript")
+    opts.add_argument("--disable-plugins")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--page-load-strategy=eager")
+    opts.add_argument("--aggressive-cache-discard")
     opts.add_argument(f"--user-agent={random.choice(USER_AGENTS)}")
     if headless_mode: opts.add_argument("--headless=new")
     if proxy: opts.add_argument(f"--proxy-server={proxy}")
     
-    # Try to find Chrome/Chromium binary
     chrome_paths = [
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
+        "/usr/bin/google-chrome-stable",
         "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable"
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser"
     ]
     
     for path in chrome_paths:
@@ -68,9 +87,13 @@ def build_chrome(headless_mode=False, proxy=None):
             break
     
     try:
-        driver_path = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
-    except:
         driver_path = ChromeDriverManager().install()
+    except:
+        try:
+            driver_path = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
+        except:
+            driver_path = "/usr/bin/chromedriver"
+    
     return webdriver.Chrome(service=Service(driver_path), options=opts)
 
 def find_emails(html):
@@ -99,26 +122,27 @@ def find_emails(html):
     return sorted(set(valid_emails))
 def find_phone_numbers(html): return list(set([m.strip() for m in PHONE_REGEX.findall(re.sub(r'<[^>]+>', ' ', html)) if len(re.sub(r'[^\d]','',m))>=10]))
 
-def collect_gmaps_links(config):
+def collect_gmaps_links(session_id, config):
+    session = get_session(session_id)
     driver = build_chrome(config.get("headless_mode", True), config.get("proxy"))
     queries = [f"{config.get('general_search_term','')} {cat} {zipc}".strip() for cat in config.get('categories',[]) for zipc in config.get('zipcodes',[])]
     for i, query in enumerate(queries):
-        if APP_STATE["stop_scraping_flag"]: break
+        if session["stop_scraping_flag"]: break
         driver.get(f"https://www.google.com/maps/search/{urllib.parse.quote(query)}")
         try:
             feed = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, '//div[@role="feed"]')))
-            for _ in range(config.get("max_scrolls", 20)):
-                driver.execute_script("arguments[0].scrollBy(0, 2000);", feed)
-                time.sleep(1)
+            for _ in range(config.get("max_scrolls", 10)):
+                driver.execute_script("arguments[0].scrollBy(0, 3000);", feed)
+                time.sleep(0.3)
                 cards = driver.find_elements(By.CSS_SELECTOR, 'a.hfpxzc')
                 for c in cards[-30:]:
                     href = c.get_attribute("href")
                     if href and "/maps/place/" in href:
-                        with state_lock:
-                            if (href, query, "") not in APP_STATE["collected_links"]:
-                                APP_STATE["collected_links"].append((href, query, ""))
-                with state_lock: link_count = len(APP_STATE["collected_links"])
-                update_status(f"Query {i+1}/{len(queries)}: Found {link_count} links", link_count=link_count, link_progress=(i+1)/len(queries))
+                        with session["lock"]:
+                            if (href, query, "") not in session["collected_links"]:
+                                session["collected_links"].append((href, query, ""))
+                with session["lock"]: link_count = len(session["collected_links"])
+                update_status(session_id, f"Query {i+1}/{len(queries)}: Found {link_count} links", link_count=link_count, link_progress=(i+1)/len(queries))
         except: pass
     driver.quit()
 
@@ -134,27 +158,48 @@ def scrape_website_selenium(url, headless_mode, proxy=None):
     driver = None
     try:
         driver = build_chrome(headless_mode, proxy)
-        driver.set_page_load_timeout(12)
+        driver.set_page_load_timeout(10)
         driver.get(url)
-        time.sleep(1.5)
+        time.sleep(1)
         
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-        time.sleep(0.5)
+        emails = set()
         
-        emails = set(find_emails(driver.page_source))
+        # Scroll entire page
+        for _ in range(5):
+            driver.execute_script("window.scrollBy(0, 1000);")
+            time.sleep(0.4)
+            emails.update(find_emails(driver.page_source))
+        
         socials = extract_social_links(driver.page_source)
         
-        if not emails:
-            contact_links = driver.find_elements(By.XPATH, "//a[contains(translate(text(), 'CONTACT', 'contact'), 'contact') or contains(translate(text(), 'ABOUT', 'about'), 'about')]")
-            for link in contact_links[:2]:
+        # Check ALL internal links for emails
+        try:
+            all_links = driver.find_elements(By.TAG_NAME, 'a')
+            contact_keywords = ['contact', 'about', 'team', 'reach', 'connect', 'email', 'support', 'info']
+            
+            for link in all_links[:30]:
                 try:
                     href = link.get_attribute('href')
-                    if href and url in href:
+                    text = link.text.lower()
+                    
+                    if href and url in href and any(kw in href.lower() or kw in text for kw in contact_keywords):
                         driver.get(href)
-                        time.sleep(1)
+                        time.sleep(0.8)
+                        
+                        # Scroll this page too
+                        for _ in range(3):
+                            driver.execute_script("window.scrollBy(0, 1000);")
+                            time.sleep(0.3)
+                        
                         emails.update(find_emails(driver.page_source))
-                        if emails: break
+                        
+                        if len(emails) >= 3:
+                            break
+                            
+                        driver.back()
+                        time.sleep(0.5)
                 except: continue
+        except: pass
         
         return list(emails), socials
     except:
@@ -168,21 +213,31 @@ def scrape_website_data(url, headless_mode, proxy=None):
     
     try:
         session = requests.Session()
-        r = session.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=8, proxies={"http": proxy, "https": proxy} if proxy else None)
+        r = session.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=5)
         if r.status_code == 200:
             all_emails.update(find_emails(r.text))
             socials = extract_social_links(r.text)
             
-            contact_pages = ['/contact', '/contact-us', '/about', '/about-us', '/team', '/reach-us', '/get-in-touch', '/connect']
+            # Check ALL possible contact pages
+            contact_pages = [
+                '/contact', '/contact-us', '/contactus', '/contact_us',
+                '/about', '/about-us', '/aboutus', '/about_us',
+                '/team', '/our-team', '/staff',
+                '/reach-us', '/get-in-touch', '/connect',
+                '/support', '/help', '/info',
+                '/email', '/reach', '/touch'
+            ]
+            
             for page in contact_pages:
                 try:
                     contact_url = urllib.parse.urljoin(url, page)
-                    cr = session.get(contact_url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=6)
+                    cr = session.get(contact_url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=3)
                     if cr.status_code == 200:
                         all_emails.update(find_emails(cr.text))
                 except: continue
     except: pass
     
+    # ALWAYS use Selenium for deep scraping
     selenium_emails, selenium_socials = scrape_website_selenium(url, headless_mode, proxy)
     all_emails.update(selenium_emails)
     for k, v in selenium_socials.items():
@@ -217,37 +272,72 @@ def scrape_facebook_page(fb_url, headless_mode, proxy=None):
     if not fb_url: return [], []
     driver = None
     try:
-        driver = build_chrome(headless_mode, proxy)
+        opts = Options()
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument(f"--user-agent={random.choice(USER_AGENTS)}")
+        if headless_mode: opts.add_argument("--headless=new")
+        
+        chrome_paths = ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
+        for path in chrome_paths:
+            if os.path.exists(path):
+                opts.binary_location = path
+                break
+        
+        try:
+            driver_path = ChromeDriverManager().install()
+        except:
+            try:
+                driver_path = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
+            except:
+                driver_path = "/usr/bin/chromedriver"
+        driver = webdriver.Chrome(service=Service(driver_path), options=opts)
         driver.set_page_load_timeout(15)
         
         all_emails = set()
         all_phones = set()
         
-        pages_to_check = [
+        pages = [
             fb_url.rstrip('/') + '/about',
             fb_url.rstrip('/') + '/about_contact_and_basic_info',
-            fb_url.rstrip('/')
+            fb_url.rstrip('/') + '/about_details',
+            fb_url.rstrip('/') + '/about_profile',
+            fb_url.rstrip('/'),
+            fb_url.rstrip('/') + '/posts',
+            fb_url.rstrip('/') + '/reviews'
         ]
         
-        for page_url in pages_to_check:
+        for page_url in pages:
             try:
                 driver.get(page_url)
-                time.sleep(1.5)
+                time.sleep(2)
                 
-                for _ in range(3):
+                # Aggressive scrolling
+                for i in range(10):
                     driver.execute_script("window.scrollBy(0, 800);")
-                    time.sleep(0.3)
+                    time.sleep(0.4)
+                    
+                    # Extract on every scroll
+                    html = driver.page_source
+                    all_emails.update(find_emails(html))
+                    all_phones.update(extract_facebook_phone(driver))
+                    all_phones.update(find_phone_numbers(html))
                 
+                # Click ALL expandable elements
                 try:
-                    buttons = driver.find_elements(By.XPATH, "//div[@role='button' or @role='link']")
-                    for btn in buttons[:5]:
+                    clickable = driver.find_elements(By.XPATH, "//div[@role='button'] | //span[contains(text(), 'See')] | //span[contains(text(), 'Show')] | //span[contains(text(), 'More')]")
+                    for elem in clickable[:20]:
                         try:
-                            if 'see' in btn.text.lower() or 'more' in btn.text.lower():
-                                btn.click()
-                                time.sleep(0.5)
+                            driver.execute_script("arguments[0].click();", elem)
+                            time.sleep(0.5)
+                            html = driver.page_source
+                            all_emails.update(find_emails(html))
+                            all_phones.update(extract_facebook_phone(driver))
                         except: pass
                 except: pass
                 
+                # Final extraction
                 html = driver.page_source
                 all_emails.update(find_emails(html))
                 all_phones.update(extract_facebook_phone(driver))
@@ -256,8 +346,7 @@ def scrape_facebook_page(fb_url, headless_mode, proxy=None):
             except: continue
         
         return list(all_emails), list(all_phones)
-    except Exception as e:
-        logging.info(f"Facebook scrape failed for {fb_url}: {e}")
+    except:
         return [], []
     finally:
         if driver: driver.quit()
@@ -316,9 +405,27 @@ def scrape_business_entry(gmaps_url, search_query_used, zipcode, timeout, headle
                 parts = address.split(', ')
                 if len(parts) >= 3: city = parts[-3]; state = parts[-2].split(' ')[0] if len(parts[-2].split(' ')) > 1 else ''
         
+        # Scroll Google Maps page to load all content
+        for _ in range(3):
+            driver.execute_script("window.scrollBy(0, 500);")
+            time.sleep(0.3)
+        
         html = driver.page_source
         maps_emails = find_emails(html)
+        
+        # Click on website link in Maps to get more emails
+        try:
+            website_btn = driver.find_elements(By.XPATH, "//a[contains(@href, 'http') and not(contains(@href, 'google'))]")
+            for btn in website_btn[:5]:
+                try:
+                    href = btn.get_attribute('href')
+                    if href and 'facebook' not in href and 'instagram' not in href:
+                        maps_emails.update(find_emails(href))
+                except: pass
+        except: pass
+        
         maps_email = get_best_email(maps_emails)
+        logging.info(f"[{name}] Google Maps emails: {maps_emails}")
         
         website_emails, socials = [], {"Facebook": "", "Instagram": "", "Twitter": "", "LinkedIn": ""}
         if website:
@@ -332,8 +439,7 @@ def scrape_business_entry(gmaps_url, search_query_used, zipcode, timeout, headle
             fb_emails, fb_phones = scrape_facebook_page(socials["Facebook"], headless_mode, proxy)
         fb_email = get_best_email(fb_emails)
         
-        insta_emails, _ = scrape_website_data(socials["Instagram"], headless_mode, proxy) if socials["Instagram"] else ([], {})
-        insta_email = get_best_email(insta_emails)
+        insta_email = ""
         
         if fb_email:
             final_email = fb_email
@@ -341,8 +447,6 @@ def scrape_business_entry(gmaps_url, search_query_used, zipcode, timeout, headle
             final_email = website_email
         elif maps_email:
             final_email = maps_email
-        elif insta_email:
-            final_email = insta_email
         else:
             final_email = ""
         
@@ -373,72 +477,108 @@ def scrape_business_entry(gmaps_url, search_query_used, zipcode, timeout, headle
     finally:
         driver.quit()
 
-def scrape_details(config):
-    links = APP_STATE["collected_links"]
-    update_status(f"Scraping {len(links)} businesses...", total_to_scrape=len(links))
+def scrape_details(session_id, config):
+    session = get_session(session_id)
+    links = session["collected_links"]
+    update_status(session_id, f"Scraping {len(links)} businesses...", total_to_scrape=len(links))
     results = []
-    with ThreadPoolExecutor(max_workers=config.get("max_workers", 5)) as pool:
+    with ThreadPoolExecutor(max_workers=config.get("max_workers", 10)) as pool:
         futures = {pool.submit(scrape_business_entry, url, query, zipc, config.get("scrape_timeout", 15), config.get("headless_mode", True), config.get("proxy")): (url, query, zipc) for url, query, zipc in links}
         for i, fut in enumerate(as_completed(futures)):
-            if APP_STATE["stop_scraping_flag"]: break
+            if session["stop_scraping_flag"]: break
             try: res = fut.result()
             except: res = None
             if res: results.append(res)
-            update_status(f"Scraped {len(results)}/{len(links)}", detail_progress=(i+1)/len(links), scraped_count=len(results))
-    with state_lock: APP_STATE["results_df"] = pd.DataFrame(results)
+            update_status(session_id, f"Scraped {len(results)}/{len(links)}", detail_progress=(i+1)/len(links), scraped_count=len(results))
+    with session["lock"]: session["results_df"] = pd.DataFrame(results)
 
-def scraping_worker(config):
+def scraping_worker(session_id, config):
+    session = get_session(session_id)
     try:
-        with state_lock: APP_STATE.update({"scraping_active": True, "stop_scraping_flag": False, "results_df": pd.DataFrame(), "collected_links": [], "link_count": 0, "scraped_count": 0, "total_to_scrape": 0})
-        update_status("Collecting links...")
-        collect_gmaps_links(config)
-        if not APP_STATE["stop_scraping_flag"] and APP_STATE["collected_links"]:
-            update_status("Scraping details...")
-            scrape_details(config)
-            update_status("Complete!")
-    except Exception as e: update_status(f"Error: {e}")
+        with session["lock"]: 
+            session["scraping_active"] = True
+            session["stop_scraping_flag"] = False
+            session["results_df"] = pd.DataFrame()
+            session["collected_links"] = []
+            session["link_count"] = 0
+            session["scraped_count"] = 0
+            session["total_to_scrape"] = 0
+        update_status(session_id, "Collecting links...")
+        collect_gmaps_links(session_id, config)
+        if not session["stop_scraping_flag"] and session["collected_links"]:
+            update_status(session_id, "Scraping details...")
+            scrape_details(session_id, config)
+            update_status(session_id, "Complete! Ready for next job.")
+        else:
+            update_status(session_id, "Ready for next job.")
+    except Exception as e: 
+        update_status(session_id, f"Error: {e}. Ready for next job.")
     finally:
-        with state_lock: APP_STATE["scraping_active"] = False
+        with session["lock"]: 
+            session["scraping_active"] = False
+            session["stop_scraping_flag"] = False
 
 @app.route("/")
 def index(): return render_template("index.html")
 
 @app.route("/start-scraping", methods=["POST"])
 def start_scraping():
-    with state_lock:
-        if APP_STATE["scraping_active"]: return jsonify({"status": "error", "message": "Already running"}), 400
-    threading.Thread(target=scraping_worker, args=(request.json or {},), daemon=True).start()
+    session_id = request.headers.get('X-Session-ID', 'default')
+    
+    with SESSIONS_LOCK:
+        active_count = sum(1 for s in SESSIONS.values() if s["scraping_active"])
+        if active_count >= MAX_CONCURRENT_SESSIONS:
+            return jsonify({"status": "error", "message": f"Maximum {MAX_CONCURRENT_SESSIONS} concurrent sessions reached. Please wait."}), 200
+    
+    session = get_session(session_id)
+    with session["lock"]:
+        if session["scraping_active"]: 
+            return jsonify({"status": "error", "message": "Your session is already scraping. Please wait."}), 200
+    
+    threading.Thread(target=scraping_worker, args=(session_id, request.json or {}), daemon=True).start()
     return jsonify({"status": "success", "message": "Started"})
 
 @app.route("/status")
 def status():
-    with state_lock: return jsonify({k: v for k, v in APP_STATE.items() if k != "results_df"})
+    session_id = request.headers.get('X-Session-ID', 'default')
+    session = get_session(session_id)
+    with session["lock"]: return jsonify({k: v for k, v in session.items() if k not in ["results_df", "lock"]})
 
 @app.route("/stop-scraping", methods=["POST"])
 def stop_scraping():
-    with state_lock: APP_STATE["stop_scraping_flag"] = True
-    return jsonify({"status": "success"})
+    session_id = request.headers.get('X-Session-ID', 'default')
+    session = get_session(session_id)
+    with session["lock"]: 
+        session["stop_scraping_flag"] = True
+        session["scraping_active"] = False
+    return jsonify({"status": "success", "message": "Stopped"})
 
 @app.route("/get-results")
 def get_results():
-    with state_lock: return jsonify(APP_STATE["results_df"].to_dict(orient="records") if not APP_STATE["results_df"].empty else [])
+    session_id = request.headers.get('X-Session-ID', 'default')
+    session = get_session(session_id)
+    with session["lock"]: return jsonify(session["results_df"].to_dict(orient="records") if not session["results_df"].empty else [])
 
 @app.route("/download-csv")
 def download_csv():
-    with state_lock:
-        if not APP_STATE["results_df"].empty:
+    session_id = request.headers.get('X-Session-ID') or request.args.get('session', 'default')
+    session = get_session(session_id)
+    with session["lock"]:
+        if not session["results_df"].empty:
             buf = io.BytesIO()
-            APP_STATE["results_df"].to_csv(buf, index=False, encoding="utf-8-sig")
+            session["results_df"].to_csv(buf, index=False, encoding="utf-8-sig")
             buf.seek(0)
             return send_file(buf, as_attachment=True, download_name=f"scraped_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mimetype="text/csv")
     return "No data", 404
 
 @app.route("/download-excel")
 def download_excel():
-    with state_lock:
-        if not APP_STATE["results_df"].empty:
+    session_id = request.headers.get('X-Session-ID') or request.args.get('session', 'default')
+    session = get_session(session_id)
+    with session["lock"]:
+        if not session["results_df"].empty:
             buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="xlsxwriter") as writer: APP_STATE["results_df"].to_excel(writer, index=False, sheet_name="Data")
+            with pd.ExcelWriter(buf, engine="xlsxwriter") as writer: session["results_df"].to_excel(writer, index=False, sheet_name="Data")
             buf.seek(0)
             return send_file(buf, as_attachment=True, download_name=f"scraped_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     return "No data", 404
